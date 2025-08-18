@@ -17,12 +17,18 @@
 (define-constant ERR_CHALLENGE_ENDED (err u108))
 (define-constant ERR_INVALID_CONSERVATION_TIER (err u109))
 (define-constant ERR_NO_BASELINE_USAGE (err u110))
+(define-constant ERR_QUALITY_READING_NOT_FOUND (err u111))
+(define-constant ERR_INVALID_QUALITY_METRIC (err u112))
+(define-constant ERR_QUALITY_THRESHOLD_EXCEEDED (err u113))
+(define-constant ERR_INSUFFICIENT_COMPENSATION_FUND (err u114))
 
 (define-data-var token-price-per-gallon uint u10)
 (define-data-var total-water-consumed uint u0)
 (define-data-var contract-paused bool false)
 (define-data-var current-season-id uint u1)
 (define-data-var conservation-reward-rate uint u5)
+(define-data-var quality-compensation-fund uint u10000)
+(define-data-var quality-monitoring-enabled bool true)
 
 (define-map smart-meters
   { meter-id: (string-ascii 32) }
@@ -109,6 +115,62 @@
     best-conservation-rate: uint,
     total-conservation-rewards: uint,
     challenge-wins: uint
+  }
+)
+
+(define-map water-quality-standards
+  { quality-type: (string-ascii 20) }
+  {
+    min-value: uint,
+    max-value: uint,
+    unit: (string-ascii 10),
+    compensation-rate: uint,
+    active: bool
+  }
+)
+
+(define-map meter-quality-readings
+  { meter-id: (string-ascii 32), timestamp: uint }
+  {
+    ph-level: uint,
+    chlorine-level: uint,
+    turbidity: uint,
+    contaminant-level: uint,
+    overall-quality-score: uint,
+    passed-standards: bool
+  }
+)
+
+(define-map quality-alerts
+  { alert-id: uint }
+  {
+    meter-id: (string-ascii 32),
+    alert-type: (string-ascii 30),
+    severity: uint,
+    timestamp: uint,
+    resolved: bool,
+    compensation-issued: uint
+  }
+)
+
+(define-map user-quality-history
+  { user: principal, month: uint }
+  {
+    total-readings: uint,
+    failed-readings: uint,
+    total-compensation: uint,
+    average-quality-score: uint
+  }
+)
+
+(define-map quality-compensation-claims
+  { claim-id: uint }
+  {
+    user: principal,
+    meter-id: (string-ascii 32),
+    compensation-amount: uint,
+    claim-timestamp: uint,
+    processed: bool
   }
 )
 
@@ -482,6 +544,179 @@
   )
 )
 
+(define-public (initialize-quality-standards)
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (map-set water-quality-standards { quality-type: "ph" } { min-value: u65, max-value: u85, unit: "pH*10", compensation-rate: u50, active: true })
+    (map-set water-quality-standards { quality-type: "chlorine" } { min-value: u5, max-value: u40, unit: "mg/L*10", compensation-rate: u30, active: true })
+    (map-set water-quality-standards { quality-type: "turbidity" } { min-value: u0, max-value: u40, unit: "NTU*10", compensation-rate: u40, active: true })
+    (map-set water-quality-standards { quality-type: "contaminants" } { min-value: u0, max-value: u10, unit: "ppm*10", compensation-rate: u100, active: true })
+    (ok true)
+  )
+)
+
+(define-public (report-water-quality (meter-id (string-ascii 32)) (ph-level uint) (chlorine-level uint) (turbidity uint) (contaminant-level uint))
+  (let (
+    (meter-data (unwrap! (map-get? smart-meters { meter-id: meter-id }) ERR_METER_NOT_FOUND))
+    (timestamp stacks-block-height)
+    (ph-standard (unwrap! (map-get? water-quality-standards { quality-type: "ph" }) ERR_INVALID_QUALITY_METRIC))
+    (chlorine-standard (unwrap! (map-get? water-quality-standards { quality-type: "chlorine" }) ERR_INVALID_QUALITY_METRIC))
+    (turbidity-standard (unwrap! (map-get? water-quality-standards { quality-type: "turbidity" }) ERR_INVALID_QUALITY_METRIC))
+    (contaminant-standard (unwrap! (map-get? water-quality-standards { quality-type: "contaminants" }) ERR_INVALID_QUALITY_METRIC))
+    (ph-pass (and (>= ph-level (get min-value ph-standard)) (<= ph-level (get max-value ph-standard))))
+    (chlorine-pass (and (>= chlorine-level (get min-value chlorine-standard)) (<= chlorine-level (get max-value chlorine-standard))))
+    (turbidity-pass (<= turbidity (get max-value turbidity-standard)))
+    (contaminant-pass (<= contaminant-level (get max-value contaminant-standard)))
+    (all-pass (and ph-pass (and chlorine-pass (and turbidity-pass contaminant-pass))))
+    (quality-score (calculate-quality-score ph-level chlorine-level turbidity contaminant-level))
+    (meter-owner (get owner meter-data))
+  )
+    (asserts! (var-get quality-monitoring-enabled) ERR_UNAUTHORIZED)
+    (asserts! (get active meter-data) ERR_UNAUTHORIZED)
+    (map-set meter-quality-readings
+      { meter-id: meter-id, timestamp: timestamp }
+      {
+        ph-level: ph-level,
+        chlorine-level: chlorine-level,
+        turbidity: turbidity,
+        contaminant-level: contaminant-level,
+        overall-quality-score: quality-score,
+        passed-standards: all-pass
+      }
+    )
+    (if (not all-pass)
+      (begin
+        (unwrap-panic (create-quality-alert meter-id quality-score))
+        (unwrap-panic (process-quality-compensation meter-owner meter-id ph-pass chlorine-pass turbidity-pass contaminant-pass))
+        true
+      )
+      true
+    )
+    (update-user-quality-history meter-owner all-pass quality-score)
+    (ok all-pass)
+  )
+)
+
+(define-public (create-quality-alert (meter-id (string-ascii 32)) (quality-score uint))
+  (let (
+    (alert-id (+ stacks-block-height (len meter-id)))
+    (severity (if (< quality-score u30) u3 (if (< quality-score u60) u2 u1)))
+    (alert-type (if (< quality-score u30) "CRITICAL" (if (< quality-score u60) "WARNING" "MINOR")))
+  )
+    (map-set quality-alerts
+      { alert-id: alert-id }
+      {
+        meter-id: meter-id,
+        alert-type: alert-type,
+        severity: severity,
+        timestamp: stacks-block-height,
+        resolved: false,
+        compensation-issued: u0
+      }
+    )
+    (ok alert-id)
+  )
+)
+
+(define-public (process-quality-compensation (user principal) (meter-id (string-ascii 32)) (ph-pass bool) (chlorine-pass bool) (turbidity-pass bool) (contaminant-pass bool))
+  (let (
+    (ph-comp (if ph-pass u0 u50))
+    (chlorine-comp (if chlorine-pass u0 u30))
+    (turbidity-comp (if turbidity-pass u0 u40))
+    (contaminant-comp (if contaminant-pass u0 u100))
+    (total-compensation (+ ph-comp (+ chlorine-comp (+ turbidity-comp contaminant-comp))))
+    (claim-id (+ stacks-block-height (len meter-id)))
+  )
+    (asserts! (> total-compensation u0) ERR_INVALID_AMOUNT)
+    (asserts! (>= (var-get quality-compensation-fund) total-compensation) ERR_INSUFFICIENT_COMPENSATION_FUND)
+    (try! (ft-mint? aqua-token total-compensation user))
+    (var-set quality-compensation-fund (- (var-get quality-compensation-fund) total-compensation))
+    (map-set quality-compensation-claims
+      { claim-id: claim-id }
+      {
+        user: user,
+        meter-id: meter-id,
+        compensation-amount: total-compensation,
+        claim-timestamp: stacks-block-height,
+        processed: true
+      }
+    )
+    (ok total-compensation)
+  )
+)
+
+(define-public (resolve-quality-alert (alert-id uint))
+  (let ((alert-data (unwrap! (map-get? quality-alerts { alert-id: alert-id }) ERR_QUALITY_READING_NOT_FOUND)))
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (map-set quality-alerts
+      { alert-id: alert-id }
+      (merge alert-data { resolved: true })
+    )
+    (ok true)
+  )
+)
+
+(define-public (update-quality-standard (quality-type (string-ascii 20)) (min-val uint) (max-val uint) (comp-rate uint))
+  (let ((existing-standard (map-get? water-quality-standards { quality-type: quality-type })))
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (asserts! (is-some existing-standard) ERR_INVALID_QUALITY_METRIC)
+    (map-set water-quality-standards
+      { quality-type: quality-type }
+      (merge (unwrap-panic existing-standard) { min-value: min-val, max-value: max-val, compensation-rate: comp-rate })
+    )
+    (ok true)
+  )
+)
+
+(define-public (fund-quality-compensation (amount uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (asserts! (> amount u0) ERR_INVALID_AMOUNT)
+    (var-set quality-compensation-fund (+ (var-get quality-compensation-fund) amount))
+    (ok (var-get quality-compensation-fund))
+  )
+)
+
+(define-public (toggle-quality-monitoring)
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (var-set quality-monitoring-enabled (not (var-get quality-monitoring-enabled)))
+    (ok (var-get quality-monitoring-enabled))
+  )
+)
+
+(define-private (calculate-quality-score (ph uint) (chlorine uint) (turbidity uint) (contaminants uint))
+  (let (
+    (ph-score (if (and (>= ph u65) (<= ph u85)) u25 (if (and (>= ph u60) (<= ph u90)) u15 u0)))
+    (chlorine-score (if (and (>= chlorine u5) (<= chlorine u40)) u25 (if (and (>= chlorine u0) (<= chlorine u50)) u15 u0)))
+    (turbidity-score (if (<= turbidity u40) u25 (if (<= turbidity u60) u15 u0)))
+    (contaminant-score (if (<= contaminants u10) u25 (if (<= contaminants u20) u15 u0)))
+  )
+    (+ ph-score (+ chlorine-score (+ turbidity-score contaminant-score)))
+  )
+)
+
+(define-private (update-user-quality-history (user principal) (passed bool) (quality-score uint))
+  (let (
+    (current-month (/ stacks-block-height u4320))
+    (existing-history (default-to { total-readings: u0, failed-readings: u0, total-compensation: u0, average-quality-score: u0 }
+                                  (map-get? user-quality-history { user: user, month: current-month })))
+    (new-total (+ (get total-readings existing-history) u1))
+    (new-failed (if passed (get failed-readings existing-history) (+ (get failed-readings existing-history) u1)))
+    (new-avg (/ (+ (* (get average-quality-score existing-history) (get total-readings existing-history)) quality-score) new-total))
+  )
+    (map-set user-quality-history
+      { user: user, month: current-month }
+      {
+        total-readings: new-total,
+        failed-readings: new-failed,
+        total-compensation: (get total-compensation existing-history),
+        average-quality-score: new-avg
+      }
+    )
+  )
+)
+
 (define-read-only (get-token-balance (user principal))
   (ft-get-balance aqua-token user)
 )
@@ -541,3 +776,34 @@
 (define-read-only (get-conservation-reward-rate)
   (var-get conservation-reward-rate)
 )
+
+(define-read-only (get-water-quality-standard (quality-type (string-ascii 20)))
+  (map-get? water-quality-standards { quality-type: quality-type })
+)
+
+(define-read-only (get-meter-quality-reading (meter-id (string-ascii 32)) (timestamp uint))
+  (map-get? meter-quality-readings { meter-id: meter-id, timestamp: timestamp })
+)
+
+(define-read-only (get-quality-alert (alert-id uint))
+  (map-get? quality-alerts { alert-id: alert-id })
+)
+
+(define-read-only (get-user-quality-history (user principal) (month uint))
+  (map-get? user-quality-history { user: user, month: month })
+)
+
+(define-read-only (get-quality-compensation-claim (claim-id uint))
+  (map-get? quality-compensation-claims { claim-id: claim-id })
+)
+
+(define-read-only (get-quality-compensation-fund)
+  (var-get quality-compensation-fund)
+)
+
+(define-read-only (is-quality-monitoring-enabled)
+  (var-get quality-monitoring-enabled)
+)
+
+
+
